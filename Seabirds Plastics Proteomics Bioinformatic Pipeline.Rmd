@@ -1,0 +1,1091 @@
+---
+title: "Seabirds Plastics Proteomics Bioinformatic Pipeline"
+author: "Jack Rivers-Auty and Alix de Jersey"
+date: "2023-11-09"
+output: html_document
+---
+
+Code for bioinformatics of mass-spectroscopy proteomic data investing the effects of plastic ingestion in a non-model organism (Flesh-footed Shearwater Ardenna carneipes. 
+
+Requires 4 files to run, 
+    1. 2306_AdJ_NCBI.txt
+            This is available for download on ProteinXchange. It contains the raw data from the mass spectrometry. 
+    2. Protein_symbols_GitHub.csv
+            Contains the protein symbols of the proteins identified in by the mass spectrometry. 
+    3. Seabird_proteomic_sample_information.csv
+            Contains the plastic count and body morphometric data associated with each sample. 
+    4. Secreted_intracellular_significant.csv
+            Proteins mapped to organ location and secreted or intracellular.  
+  
+Markdown file generated 01/10/2023, last updated 23/11/2023. 
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+#Check if packages are installed, if not, install them
+library("tidyverse") # includes ggplot2, dplyr, tidyr, readr, purrr, tibble, stringr
+library("reshape2") # reshape dataframes
+library("plyr") # data manipulation
+library("enrichR") # Interface for the Enrichr web service
+library("htmltools") # Manipulates HTML documents in R
+library("curl") # Enables r to make HTTP requests
+library("rgl") # 3D data visualisation
+library("pkgconfig") # Useful tool when managing external libraries 
+library("pheatmap") # to generate heatmaps
+library("sjPlot") # for easy to read tables + model outputs
+library("emmeans") # linear models
+library("remotes") # Manages R packages from remote source 
+library("ggfortify") # boxcox
+library("MASS") # for boxcox transformation + generating example distributions
+library("viridis") # colour-blind friendly colours for plots
+library("RColorBrewer") # colours for plots
+library("PupillometryR") # for flat violin plots 
+```
+
+
+```{r import data}
+df_raw<- read.delim("2306_AdJ_NCBI.txt") # Import the raw mass spectrometry data 
+
+# The following code adds a column to the data frame to clean the protein descriptions as assigned by NCBI. 
+df_raw$protein<-df_raw$PG.ProteinDescriptions
+df_raw$protein<-str_remove_all(df_raw$protein, "PREDICTED:" )
+df_raw$protein<-str_remove_all(df_raw$protein, ", partial" )
+df_raw$protein<-str_remove_all(df_raw$protein, "LOW QUALITY PROTEIN: " )
+df_raw$protein<-str_remove_all(df_raw$protein, "/" )
+df_raw$protein<-gsub("\\.", "",df_raw$protein)
+df_raw$protein<-gsub("\\,", "",df_raw$protein)
+df_raw$protein<-str_remove_all(df_raw$protein, "`" )
+df_raw$protein<-str_remove_all(df_raw$protein, "'" )
+df_raw$protein<-str_remove_all(df_raw$protein, "\\\\" )
+df_raw$protein<-gsub("\\{.*\\}","",df_raw$protein)
+df_raw$protein<-gsub(";.*","",df_raw$protein)
+
+```
+
+
+# Import protein codes and sample information. 
+
+```{r}
+# The protein descriptions are not compatible with enrichR. We manually searched each description on https://www.ncbi.nlm.nih.gov/ to obtain the gene symbol. 
+df_protein <- read.csv("Protein_symbols_GitHub.csv") # import the protein symbols.
+
+sample_id<-read.csv("Seabird_proteomic_sample_information.csv") # import sample information, this includes group (high or low plastic) and body morphometric data. 
+
+group<-sample_id$Group # changing LP and HP as noted in field notes to High or Low plastic to avoid confusion. 
+group[group=="HP"]<-"High Plastic"
+group[group=="LP"]<-"Low Plastic"
+```
+
+# Assign protein codes
+
+```{r}
+# Add a column to the raw data to add the corresponding gene symbol. Use GENEGENE so it is easy to identify when a symbol has not been matched. 
+df_raw$gene_symbol<-"GENEGENE"
+
+# The following loop is to match up the protein symbols in our raw data and add the corresponding gene symbol. 
+for (i in 1:nrow(df_raw)){
+  protein_description<-df_raw$PG.ProteinDescriptions[i]
+  gene_symbol_row<-df_protein$Gene_Symbol_Alix[df_protein$PG.ProteinDescriptions==protein_description]
+  df_raw$gene_symbol[i]<-gene_symbol_row[1]
+}
+
+# Change the blinded column names assigned from mass spec back to sample ID. 
+colnames(df_raw)[5:39]<-sample_id$Sample_ID
+
+```
+
+# Significance tests
+Fisher was performed to assess missing at random. If significant the Fisher exact test p value was used as it suggests that whether or not you can detect this protein is dependent on the plastic exposure. If the Fisher Exact test was not significant and Mann-Whitney test was performed and the missing data remained missing. 
+
+```{r}
+# Add the following columns to the datasheet to before significance tests between each group for each protein. Use 999 to easily assess if code failed. 
+df_raw$Fisher<-999
+df_raw$MannW<-999
+df_raw$p_value<-999
+df_raw$NumberMissingLP<-999
+df_raw$NumberMissingHP<-999
+df_raw$Logfold<-NA
+
+# Remove no loggers and beach-washed birds. These birds have died due to starvation and are outliers in our study. 
+columns_to_remove<--(which(is.na(as.numeric(sample_id$Sample_ID)))+4)
+df_trimmed<- df_raw[,columns_to_remove]
+df_trimmed$gene_symbol <- str_remove_all(df_trimmed$gene_symbol, " ") 
+group_trimmed<-group[(columns_to_remove+4)]
+
+# This loop takes each row of df_trimmed which equals a different protein and only the sample columns (5:35), assigns low or high plastic and performs a Fisher's exact test comparing each group for each protein and places the p.value back into the original data frame in the new column "p.value". The last two lines are to calculate how many times the protein was detected within each group.  
+for(i in 1:nrow(df_trimmed)){
+  
+  dat<-df_trimmed[i,5:35]
+  LP_data<-dat[group_trimmed=="Low Plastic"]
+  HP_data<-dat[group_trimmed=="High Plastic"]
+  LP<-c(sum(is.na(LP_data)), length(LP_data))
+  HP<-c(sum(is.na(HP_data)), length(HP_data))
+  df_trimmed$Fisher[i]<-fisher.test(as.matrix(data.frame(rbind(LP,HP))))$p.value
+  
+  df_trimmed$NumberMissingLP[i]<-sum(is.na(LP_data))
+  df_trimmed$NumberMissingHP[i]<-sum(is.na(HP_data))
+  
+}
+
+```
+
+## Mann-Whitney test
+
+```{r}
+# Creating a new dataframe called df_trimmed containing proteins that are detected in ~70% of samples for each group.
+df_trimmed<-df_trimmed[(df_trimmed$NumberMissingHP<7 | df_trimmed$NumberMissingLP<8),]
+
+# This loop for each row 
+for(i in 1:nrow(df_trimmed)){
+
+  print(i)
+  dat<-as.numeric(df_trimmed[i,5:35]) # Take only the data columns for the row
+  LP_data<-dat[group_trimmed=="Low Plastic"] # Assigns the data points to their respective test group.  
+  HP_data<-dat[group_trimmed=="High Plastic"]
+
+  # Calculate if there are enough data points in each group to perform Mann-Whitney, if not = print "Too few", if yes, continue to perform Mann-Whitney. Use BoxCox transformation to apply the correct transformation to normalise the residuals. 
+  if(df_trimmed$NumberMissingHP[i]>=14 | df_trimmed$NumberMissingLP[i]>=9){
+    
+    print(i)
+    print("Too few")
+    df_trimmed$MannW[i]<-1
+   
+    } else {
+      lm1<-lm(dat~group_trimmed)
+      summary(lm1)
+      #BoxCox transformation 
+      boxcox<-MASS::boxcox(lm1,lambda = seq(-5, 5, 1/1000), plotit = F ) 
+
+      Selected.lambda <-boxcox$x[boxcox$y==max(boxcox$y)] 
+    
+      df_trimmed$MannW[i]<-wilcox.test(as.numeric(dat^Selected.lambda) ~ group_trimmed)$p.value
+      
+      df_trimmed$Logfold[i]<-log(mean(HP_data, na.rm=T)/mean(LP_data, na.rm=T), base=2)
+  }
+  
+} # Add a column to print the p_value returned from the Mann-Whitney
+for(i in 1:nrow(df_trimmed)){
+df_trimmed$p_value[i]<-min(df_trimmed$Fisher[i], df_trimmed$MannW[i], na.rm=T)
+}
+
+# Adjust for multiple comparisons using the False Discovery Rate (FDR) 
+df_trimmed$p_adjust<-p.adjust(df_trimmed$p_value, method="fdr")
+
+
+df_trimmed$ProportionMissingHP<-df_trimmed$NumberMissingHP/18
+df_trimmed$ProportionMissingLP<-df_trimmed$NumberMissingLP/13
+```
+
+## Figure 1a
+Scaled Principal Component Analysis (PCA) Plot
+```{r, fig.show='asis'}
+
+col<-rep("#f89540", length(group_trimmed)) # Assign a colour to all data points
+col[group_trimmed=="High Plastic"]<-"#0d0887" # Assign a different colour to one of the two groups. 
+
+PCA_matrix<-t(as.matrix(df_trimmed[complete.cases(df_trimmed), 5:35])) # Use only proteins that were detected within all groups. 
+
+PCA<-prcomp((PCA_matrix), scale=T) # Perform PCA on PCA_matrix with scaling = T (TRUE)
+summary_PCA<-round(data.frame(summary(PCA)$importance),3) # Summarise each component
+summary_PCA$PC1[2] # Extract the percentage variance explained by the second principal component (PC2)
+# pdf("Figure1a_PCA.pdf", height = 7, width =8) # Set up a PDF file
+par(fig=c(0, 1, 0, 1), oma=c(5, 2, 2, 2), mar=c(6, 4, 2, 2)) # Plot parameters and margins
+plot(PCA$x[,1:2], col=col,pch=16, cex=1.5,xlab="",ylab="") # Create a scatterplot of the first two principal components
+title(main="PCA Proteomics vs Plastic load", # Add a title to the plot
+      xlab=paste0("PCA1 ",(100*summary_PCA$PC1[2]),"%"), # Add axis titles to the plot
+      ylab=paste0("PCA2 ",(100*summary_PCA$PC2[2]),"%"))
+      legend("topleft", # Add a legend to the top left corner
+              bty = "n", 
+              legend = c("Low", "High"), 
+              pch = 16, 
+              col = c(levels(as.factor(col))), 
+              cex = 1, horiz=F, 
+      title="Plastic Load")
+
+#dev.off()# Save PDF of the plot
+
+
+```
+
+
+# Adjusted Enrichment analysis 
+  As we are working with a non-model organism (seabird) with proteomic data with unknown expected frequencies of the detect proteins, an   adjusted enrichment analysis was designed. First we will map the detected proteins of the low plastic exposure group, this will act as a baseline for comparison. Next, the code will map the pathways of the proteins which were significantly different between the high and low plastic groups. 
+  
+  For this enrichment analysis we utilised the following 6 databases: 
+    GO_Molecular_Function_2023,
+    GO_Cellular_Component_2023,
+    GO_Biological_Process_2023,
+    KEGG_2021_Human,
+    WikiPathway_2021_Human,
+    TRRUST_Transcription_Factors_2019
+    
+
+
+#### Control group enrichment analysis
+  
+Creating a list of genes detected in 70% of the control birds
+
+```{r}
+bird_column<-5:35 # Isolate the columns containing just protein counts 
+
+# Create a new data frame containing the Low plastic samples which represent our control for the enrichment analysis. This is created from df_trimmed minus the High Plastic samples. 
+Control_bird_df<-df_trimmed[,-bird_column[group_trimmed=="High Plastic"]]
+```
+
+Enrichment analysis (mapping) of the control birds
+```{r, message=FALSE, results='hide'}
+# Extract the gene symbols from the control bird dataframe 
+genes_of_interest<-Control_bird_df$gene_symbol
+
+# Create a list of all the databases available in Enrichr
+databases<-listEnrichrDbs()
+
+# Create a subset of the databases of interest
+databases_of_interest<-c(
+  "GO_Molecular_Function_2023", 
+  "GO_Cellular_Component_2023", 
+  "GO_Biological_Process_2023",
+  "KEGG_2021_Human", 
+  "WikiPathway_2021_Human", 
+  "TRRUST_Transcription_Factors_2019")
+
+# Perform enrichment using enrichr on the control genes  
+enrichment_control<-enrichr(as.character(genes_of_interest), databases = databases_of_interest)
+```
+
+#### Enrichment analysis (mapping) for the Significant Genes
+
+Note this code is just grouping our genes into different biological pathways/locations/transcription factors. This enrichment analysis is not valid as it assumes we can detect all 22,000 genes
+```{r, message=FALSE}
+# Subset the gene symbols of the significant genes (where the p_adjust is less than 0.05) from the trimmed dataframe.
+genes_of_significance<-df_trimmed$gene_symbol[df_trimmed$p_adjust<0.05]
+
+# Create a list of all the databases available in Enrichr
+databases<-listEnrichrDbs()
+
+# Create a subset of the databases of interest
+databases_of_interest<-c("GO_Molecular_Function_2023",
+                         "GO_Cellular_Component_2023", 
+                         "GO_Biological_Process_2023",
+                         "KEGG_2021_Human", 
+                         "WikiPathway_2021_Human", 
+                         "TRRUST_Transcription_Factors_2019")
+
+#Selecting our genes and uploading them to 6 different enrichment databases  
+enrichment_Sig<-enrichr(as.character(genes_of_significance), databases = databases_of_interest)
+```
+
+Below is the enrichment analysis for the GO_Molecular_function database. The output observed in the View() function is where the data for Table 2 was obtained for each database. 
+
+The enrichment analysis is annotated in Chunk 12 and is repeated for each of the 6 databases. 
+
+1.GO_Molecular_function_2023 database 
+```{r}
+# Building the significant and control protein data frames for the GO_Molecular_Function database
+go_mol_function_Sig<-enrichment_Sig$GO_Molecular_Function_2023[,c("Term","Overlap","Genes")]
+go_mol_function_Control<-enrichment_control$GO_Molecular_Function_2023[,c("Term","Overlap","Genes")]
+
+# Building empty columns for the loop
+go_mol_function_Sig$PermutationTest<-999
+go_mol_function_Sig$ProteinNumber<-999
+go_mol_function_Sig$ProteinNumberControl<-999
+go_mol_function_Sig$TotalControlProtein<-nrow(Control_bird_df)
+go_mol_function_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+  
+# Loop through each row of the significant data frame 
+for(i in 1:nrow(go_mol_function_Sig)) {
+
+  
+  go_mol_function_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", go_mol_function_Sig$Overlap[i])) # Extract and process data from the "Overlap" column
+  
+  if(go_mol_function_Sig$Term[i] %in% go_mol_function_Control$Term){
+  Control_data<-go_mol_function_Control[go_mol_function_Control$Term==go_mol_function_Sig$Term[i],] # Check if the term is present in the control data frame 
+  
+  go_mol_function_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap)) # Extract relevant information from the control data frame
+  
+  } else {
+    go_mol_function_Sig$ProteinNumberControl[i]<-0 # If the term is not present in the control data, set ProteinNumberControl to 0 
+  }
+}
+
+# Trimming out the very low count pathways. There's no point saying a pathway is enriched with 2 genes
+go_mol_function_Sig<- go_mol_function_Sig[go_mol_function_Sig$ProteinNumber>2,]
+
+# Generate p-values by performing a permutation test
+for(i in 1:nrow(go_mol_function_Sig)){
+
+  control<-c(rep(1,go_mol_function_Sig$ProteinNumberControl[i]), rep(0,go_mol_function_Sig$TotalControlProtein[i] -       
+                                                                       go_mol_function_Sig$ProteinNumberControl[i])) # Create a control vector for permutation test
+
+  repeats<-10000 # Perform a permutation test with 10,000 repeats
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, go_mol_function_Sig$TotalSignificant[i]))
+  
+}
+
+  significant<-go_mol_function_Sig$ProteinNumber[i] # Calculate the p.value based on the permutation test
+
+  go_mol_function_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(go_mol_function_Sig$ProteinNumberControl[i], (go_mol_function_Sig$TotalControlProtein[i] -
+                                                                go_mol_function_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (go_mol_function_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"),
+    stringsAsFactors = FALSE
+) # Create a data frame for pathway and non-pathway counts 
+  colnames(dat) <- c("Control", "Significant")
+  
+}
+
+# GO_Molecular_Funciton Enrichment results
+View(go_mol_function_Sig)
+
+```
+
+
+2. GO_Cellular_Component_2023 database
+```{r}
+
+GO_Cellular_Component_Sig<-enrichment_Sig$GO_Cellular_Component_2023[,c("Term","Overlap","Genes")]
+GO_Cellular_Component_Control<-enrichment_control$GO_Cellular_Component_2023[,c("Term","Overlap","Genes")]
+
+GO_Cellular_Component_Sig$PermutationTest<-999
+GO_Cellular_Component_Sig$ProteinNumber<-999
+GO_Cellular_Component_Sig$ProteinNumberControl<-999
+GO_Cellular_Component_Sig$TotalControlProtein<-nrow(Control_bird_df)
+GO_Cellular_Component_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+
+for(i in 1:nrow(GO_Cellular_Component_Sig)) {
+
+  GO_Cellular_Component_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", GO_Cellular_Component_Sig$Overlap[i]))
+  
+  if(GO_Cellular_Component_Sig$Term[i] %in% GO_Cellular_Component_Control$Term){
+  Control_data<-GO_Cellular_Component_Control[GO_Cellular_Component_Control$Term==GO_Cellular_Component_Sig$Term[i],]
+  
+  GO_Cellular_Component_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    GO_Cellular_Component_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+GO_Cellular_Component_Sig<- GO_Cellular_Component_Sig[GO_Cellular_Component_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(GO_Cellular_Component_Sig)){
+
+  control<-c(rep(1,GO_Cellular_Component_Sig$ProteinNumberControl[i]), rep(0,GO_Cellular_Component_Sig$TotalControlProtein[i] - 
+                                                                             GO_Cellular_Component_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, GO_Cellular_Component_Sig$TotalSignificant[i]))
+  
+}
+
+  significant<-GO_Cellular_Component_Sig$ProteinNumber[i]
+
+  GO_Cellular_Component_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(GO_Cellular_Component_Sig$ProteinNumberControl[i], (GO_Cellular_Component_Sig$TotalControlProtein[i] -
+                                                                      GO_Cellular_Component_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (GO_Cellular_Component_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+View(GO_Cellular_Component_Sig)
+```
+
+
+3. GO_Biological_Process_2023 database
+```{r}
+
+GO_Bioloigcal_Process_Sig<-enrichment_Sig$GO_Biological_Process_2023[,c("Term","Overlap","Genes")]
+GO_Bioloigcal_Process_Control<-enrichment_control$GO_Biological_Process_2023[,c("Term","Overlap","Genes")]
+
+GO_Bioloigcal_Process_Sig$PermutationTest<-999
+GO_Bioloigcal_Process_Sig$ProteinNumber<-999
+GO_Bioloigcal_Process_Sig$ProteinNumberControl<-999
+GO_Bioloigcal_Process_Sig$TotalControlProtein<-nrow(Control_bird_df)
+GO_Bioloigcal_Process_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+
+for(i in 1:nrow(GO_Bioloigcal_Process_Sig)) {
+
+  GO_Bioloigcal_Process_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", GO_Bioloigcal_Process_Sig$Overlap[i]))
+  
+  if(GO_Bioloigcal_Process_Sig$Term[i] %in% GO_Bioloigcal_Process_Control$Term){
+  Control_data<-GO_Bioloigcal_Process_Control[GO_Bioloigcal_Process_Control$Term==GO_Bioloigcal_Process_Sig$Term[i],]
+  
+  GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+GO_Bioloigcal_Process_Sig<- GO_Bioloigcal_Process_Sig[GO_Bioloigcal_Process_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(GO_Bioloigcal_Process_Sig)){
+
+  control<-c(rep(1,GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]), rep(0,GO_Bioloigcal_Process_Sig$TotalControlProtein[i] - 
+                                                                             GO_Bioloigcal_Process_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, GO_Bioloigcal_Process_Sig$TotalSignificant[i]))
+  
+}
+
+  significant<-GO_Bioloigcal_Process_Sig$ProteinNumber[i]
+
+  GO_Bioloigcal_Process_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(GO_Bioloigcal_Process_Sig$ProteinNumberControl[i], (GO_Bioloigcal_Process_Sig$TotalControlProtein[i] -
+                                                                      GO_Bioloigcal_Process_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (GO_Bioloigcal_Process_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+View(GO_Bioloigcal_Process_Sig)
+```
+
+4. KEGG_2021_Human
+```{r}
+
+KEGG_Sig<-enrichment_Sig$KEGG_2021_Human[,c("Term","Overlap","Genes")]
+KEGG_Control<-enrichment_control$KEGG_2021_Human[,c("Term","Overlap","Genes")]
+
+KEGG_Sig$PermutationTest<-999
+KEGG_Sig$ProteinNumber<-999
+KEGG_Sig$ProteinNumberControl<-999
+KEGG_Sig$TotalControlProtein<-nrow(Control_bird_df)
+KEGG_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+
+for(i in 1:nrow(KEGG_Sig)) {
+
+  KEGG_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", KEGG_Sig$Overlap[i]))
+  
+  if(KEGG_Sig$Term[i] %in% KEGG_Control$Term){
+  Control_data<-KEGG_Control[KEGG_Control$Term==KEGG_Sig$Term[i],]
+  
+  KEGG_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    KEGG_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+KEGG_Sig<- KEGG_Sig[KEGG_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(KEGG_Sig)){
+
+  control<-c(rep(1,KEGG_Sig$ProteinNumberControl[i]), rep(0,KEGG_Sig$TotalControlProtein[i] - KEGG_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, KEGG_Sig$TotalSignificant[i]))
+}
+
+  significant<-KEGG_Sig$ProteinNumber[i]
+
+  KEGG_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(KEGG_Sig$ProteinNumberControl[i], (KEGG_Sig$TotalControlProtein[i] - KEGG_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (KEGG_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+View(KEGG_Sig)
+```
+
+5. WikiPathway_2021_Human database 
+```{r}
+
+WikiPathway_Sig<-enrichment_Sig$WikiPathway_2021_Human[,c("Term","Overlap","Genes")]
+WikiPathway_Control<-enrichment_control$WikiPathway_2021_Human[,c("Term","Overlap","Genes")]
+
+WikiPathway_Sig$PermutationTest<-999
+WikiPathway_Sig$ProteinNumber<-999
+WikiPathway_Sig$ProteinNumberControl<-999
+WikiPathway_Sig$TotalControlProtein<-nrow(Control_bird_df)
+WikiPathway_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+
+for(i in 1:nrow(WikiPathway_Sig)) {
+
+  WikiPathway_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", WikiPathway_Sig$Overlap[i]))
+  
+  if(WikiPathway_Sig$Term[i] %in% WikiPathway_Control$Term){
+  Control_data<-WikiPathway_Control[WikiPathway_Control$Term==WikiPathway_Sig$Term[i],]
+  
+  WikiPathway_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    WikiPathway_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+WikiPathway_Sig<- WikiPathway_Sig[WikiPathway_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(WikiPathway_Sig)){
+
+  control<-c(rep(1,WikiPathway_Sig$ProteinNumberControl[i]), rep(0,WikiPathway_Sig$TotalControlProtein[i] - 
+                                                                   WikiPathway_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, WikiPathway_Sig$TotalSignificant[i]))
+}
+
+  significant<-WikiPathway_Sig$ProteinNumber[i]
+
+  WikiPathway_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(WikiPathway_Sig$ProteinNumberControl[i], (WikiPathway_Sig$TotalControlProtein[i] - 
+                                                            WikiPathway_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (WikiPathway_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+View(WikiPathway_Sig)
+```
+
+6. TRRUST_Transcription_Factors_2019
+```{r}
+
+TRRUST_Sig<-enrichment_Sig$TRRUST_Transcription_Factors_2019[,c("Term","Overlap","Genes")]
+TRRUST_Control<-enrichment_control$TRRUST_Transcription_Factors_2019[,c("Term","Overlap","Genes")]
+
+TRRUST_Sig$PermutationTest<-999
+TRRUST_Sig$ProteinNumber<-999
+TRRUST_Sig$ProteinNumberControl<-999
+TRRUST_Sig$TotalControlProtein<-nrow(Control_bird_df)
+TRRUST_Sig$TotalSignificant<-sum(df_trimmed$p_adjust<0.05)
+
+for(i in 1:nrow(TRRUST_Sig)) {
+
+  TRRUST_Sig$ProteinNumber[i]<-as.numeric(sub("\\/.*", "", TRRUST_Sig$Overlap[i]))
+  
+  if(TRRUST_Sig$Term[i] %in% TRRUST_Control$Term){
+  Control_data<-TRRUST_Control[TRRUST_Control$Term==TRRUST_Sig$Term[i],]
+  
+  TRRUST_Sig$ProteinNumberControl[i]<-as.numeric(sub("\\/.*", "", Control_data$Overlap))
+  
+  } else {
+    TRRUST_Sig$ProteinNumberControl[i]<-0
+  }
+}
+
+TRRUST_Sig<- TRRUST_Sig[TRRUST_Sig$ProteinNumber>2,]
+
+for(i in 1:nrow(TRRUST_Sig)){
+
+  control<-c(rep(1,TRRUST_Sig$ProteinNumberControl[i]), rep(0,TRRUST_Sig$TotalControlProtein[i] - TRRUST_Sig$ProteinNumberControl[i]))
+
+  repeats<-10000
+
+  n<-rep(9999, repeats)
+  sum(control)
+
+for (j in 1:repeats){
+  
+  n[j]<-sum(sample(control, TRRUST_Sig$TotalSignificant[i]))
+}
+
+  significant<-TRRUST_Sig$ProteinNumber[i]
+
+  TRRUST_Sig$PermutationTest[i]<- sum(n>=(significant))/repeats
+
+  dat <- data.frame(
+    "Control" = c(TRRUST_Sig$ProteinNumberControl[i], (TRRUST_Sig$TotalControlProtein[i] - TRRUST_Sig$ProteinNumberControl[i])),
+    "Significant" = c(significant, (TRRUST_Sig$TotalSignificant[i]-significant)),
+    row.names = c("Pathway", "Non-pathway"), stringsAsFactors = FALSE
+)
+  colnames(dat) <- c("Control", "Significant")
+
+  dat
+}
+
+View(TRRUST_Sig)
+```
+
+
+# Generating enrichment analysis figures
+
+Summing protein counts when multiple proteins identified correspond to the same gene. E.g., cleavage products, splice variants.    
+
+```{R}
+# Copy the current data frame into a new one
+df_graph<-df_trimmed 
+
+# Create a table of gene symbols and their frequency
+table_gene<-data.frame(table(df_graph$gene_symbol))
+
+# Identify those that appear more than once
+genes_duplicates<-as.character(table_gene$Var1[table_gene$Freq>1])
+
+# Loop through each duplicate starting from the second one
+for(i in 2:length(genes_duplicates)){
+
+  dat_g<-df_graph[which(df_graph$gene_symbol == genes_duplicates[i]),] # Extract the row/s
+  df_graph<-df_graph[-which(df_graph$gene_symbol == genes_duplicates[i]),] # Remove the rows corresponding to the current duplicate gene symbol    from the original data frame. 
+  raw_dat_g<-colSums(dat_g[,5:35], na.rm=T) # Sum the values in the data columns for the extracted rows
+  dat_g_final<- dat_g[1,] # Take the first row of the duplicate gene symbol and replace the data columns with the summed value
+  dat_g_final[,5:35]<-raw_dat_g 
+  df_graph<-rbind(df_graph, dat_g_final) # Add the modified row back into the original data frame
+  
+  }
+
+```
+
+## Figure 1b. 
+
+Volcano plot of all secreted and intracellular proteins. 
+Significant Proteins were mapped to organ location and identified as secreted or intracellular proteins using the Human Protein Atlas and Human   Secretome databases. At http://www.proteinatlas.org/. 
+```{r, message=FALSE}
+
+# Created CSV of all gene symbols and secreted/intracellular 
+secreted_intracellular_significant <- read_csv("Secreted_intracellular_significant.csv") 
+
+# Create a subset list of the significant secreted proteins
+significant_secreted <- subset(secreted_intracellular_significant, Intracellular_Secreted == "Secreted")
+significant_secreted <- as.vector(significant_secreted$Genes)
+
+# Create a subset list of the significant intracellular proteins
+significant_intracellular <- subset(secreted_intracellular_significant, Intracellular_Secreted == "Intracellular")
+significant_intracellular <- as.vector(significant_intracellular$Genes)
+
+# Volcano plot significant intracellular and secreted proteins.
+
+# Create a new column 'Sig' indicating whether the adjusted p-value is less than 0.05. 
+df_graph$Sig<-df_graph$p_adjust<0.05
+
+# Create columns 'Up' and 'Down' indicating increased or decrease abundance of proteins based on Logfold and Sig
+df_graph$Up<-(df_graph$Logfold>0)*df_graph$Sig
+df_graph$Down<-(df_graph$Logfold<0)*df_graph$Sig
+
+# Create a new column 'colour' with a default colour for all proteins. This will end up signifying non-significant proteins.
+df_graph$colour<-rep("#999999",nrow(df_graph))
+
+# Define the pathways of significant proteins of interest to graph
+pathway1<-significant_intracellular
+pathway2<-significant_secreted
+
+# Assign specific colours to proteins in the defined pathways
+df_graph$colour[df_graph$gene_symbol %in% pathway1]<-"#355f8d"
+df_graph$colour[df_graph$gene_symbol %in% pathway2]<-"#22a884"
+
+# Create a new column 'order' with a default value of 0.95 for all proteins.
+df_graph$order<-rep(0.95,nrow(df_graph))
+
+# Set the order to 1.4 for proteins in the specified pathways. 
+df_graph$order[df_graph$gene_symbol %in% c(pathway1,pathway2)]<-1.4
+
+# Order the dataframe based on the 'order' column in ascending order
+df_graph_ordered<-df_graph[order(df_graph$order,decreasing = F),]
+
+# Create a list for specific proteins of interest to be labelled. These are proteins mentioned throughout the manuscript. 
+labels <- c("PGA5", "GAPDH", "HMGB1", "ALB", "BDNF", "LDHA", "LDHB")
+
+# Select the rows from 'gene_symbols' to match the defined labels. 
+df_graph_ordered$gene_symbol[df_graph_ordered$gene_symbol %in% labels]
+
+# Set the plotting ranges.
+xmin<--4
+xmax<-4
+ymin<-0.001
+ymax<-5
+
+# Create a PDF output of the Volcano Plot. 
+#pdf("volcanoplot_significant_proteins_secreted_intracellular_labelled.pdf", height=7, width=8)
+
+# Create the initial base plot.
+plot.new() # Create a new plotting window
+plot(df_graph_ordered$Logfold, # X axis values
+     -log(df_graph_ordered$p_adjust, base=10), # Y axis values, log(10) value of p_adjust
+     col=df_graph_ordered$colour, # Colour as defined above
+     pch=16, # Filled circles
+     cex=df_graph_ordered$order, # Point size as defined above 
+     xlab="", # No x axis label
+     ylab="", # No y axis label
+     xlim=c(xmin,xmax), # Define x axis limits
+     ylim=c(ymin,ymax), # Define y axis limits
+     axes=F # Sepress plotting of axes
+     )
+
+# Add x and y axis.
+axis(1)
+axis(2)
+
+# Add the specific protein labels.
+text(df_graph_ordered$Logfold[df_graph_ordered$gene_symbol %in% labels], 
+     -log(df_graph_ordered$p_adjust, base=10)[df_graph_ordered$gene_symbol %in% labels], 
+     labels, 
+     adj=c(0,0), 
+     cex=0.2
+     )
+
+# Add a plot title and legend.
+title(xlab="Fold change (log2)", ylab="Adjusted p-value (log10)",mgp=c(2,2,0))
+legend(xmin,y=(1*ymax),  legend = c("Intracellular proteins", "Secreted proteins"), 
+       pch = 16, col = c("#355f8d","#22a884"), cex = 1, horiz=F,box.lwd = 0,box.col = "white",bg = "white")
+
+# Add a horizontal dashed line to represent significance. 
+abline(h=1.36437635,lty=3)
+
+# Save the PDF file
+#dev.off()
+
+```
+
+## Figure 2. 
+
+Code to generate the Raincloud plots. The anatomical diagram was generated in Illustrator. 
+```{r}
+# Figure 2 genes to graph include "BDNF", "PGA5", "ALB" and "GPX3".
+gene_to_graph<-"BDNF" # Swap the gene symbol to the protein to be graphed using the gene symbol. 
+
+# Subset the data columns for the specified gene. 
+protein_Count<-df_graph[df_graph$gene_symbol==gene_to_graph, 5:35]
+
+# Calculate the sum of the protein count and ignore the missing values. 
+protein_Count<-colSums(protein_Count, na.rm=F)
+
+# Create a new dataframe with columns 'group_trimmed' and 'protein count'
+graph_data<-data.frame(group_trimmed, as.numeric(protein_Count))
+
+# Rename the columns
+colnames(graph_data)<-c("Plastics", "Protein_count")
+
+# Calculate the number of birds where the protein was not detected in each group. 
+missing<-c(sum(is.na(graph_data$Protein_count[graph_data$Plastics=="High Plastic"])),
+           sum(is.na(graph_data$Protein_count[graph_data$Plastics=="Low Plastic"])))
+
+# Generating a color palette named "colours" with two colourblind friendly colours 
+colours <- c("#f89540", "#0d0887")
+
+# Creating a base ggplot 
+rain_cloud_plot <- ggplot(graph_data, aes(Plastics, Protein_count, fill = Plastics, col = Plastics)) + 
+  geom_flat_violin(position = position_nudge(x = 0.1, y = 0), alpha = 1, width = 0.5) + # Add a flat violin plot with some horizontal position       adjustment and transparency
+  geom_point(position = position_jitterdodge(dodge.width = 0.15, jitter.width = 0.15), size = 2, alpha = 1) + # Add points to the plot with          jittering and dodging for better visualization, along with some transparency
+  geom_boxplot(color = "black", width = 0.1, outlier.shape = NA, alpha = 1, position = position_nudge(x = -0.2, y = 0)) + # Add a black box plot,    no outliers, some transparency, and horizontal position adjustment
+  coord_flip() + # Flip the x and y axes (transposing) to create a horizontal plot
+  labs(x = "", y = "Relative levels") + # Set the x and y axis labels
+  scale_y_continuous(trans = "sqrt") + # Adjust the y-axis scale to a square root transformation
+  theme_classic() + # Apply classic theme
+  theme(legend.position = "none") + # Remove the legend
+  theme(text = element_text(size = 14)) + # Text elements font size 
+  scale_fill_manual(values = colours) + # Apply colour palette created above
+  scale_colour_manual(values = colours)+ # Apply colour palette created above
+  scale_x_discrete(labels=c("High plastic", "Low plastic")) + # Relabel x axis
+  #Annotate the missing values
+  annotate("text", label = missing, x = levels(as.factor(graph_data$Plastics)), y= c(min(graph_data$Protein_count, na.rm=T)/4))+
+  annotate("text", label = "Not detected", x = 0.5, y = c(min(graph_data$Protein_count, na.rm=T)/3))+
+  geom_hline(yintercept=min(graph_data$Protein_count, na.rm=T)*3/4, linetype = 'dashed', col = "#666666", size=1) # Creates a line separating the   detected and non-detected.
+
+# Displaying the plot
+rain_cloud_plot
+
+# Saving the plot file
+ggsave("protein_XXX_raincloud.pdf", plot = rain_cloud_plot, width = 12, height = 6)
+```
+
+## Figure 3a.
+
+Volcano plot of brain intracellular and secreted proteins
+```{r}
+# Create a list for specific proteins of interest
+brain_secreted <- list("OLFM1", "BDNF", "APOD", "CNMD", "ENPP2", "PROS1", "SERPIND1", "SERPINF1", "SOD3")
+brain_intracellular <- list("ACTR3B", "FKBP4", "OPCML", "OPCML", "PCBP3", "TAGLN3", "YWHAG", "GPX1", "GSTM3", "AGA")
+
+# The following code is annotated in Chunk 19 for Figure 1b with changes to the pathways selected. Swap pathway1 and pathway2 to brain_secreted and brain_intracelluar as listed above. Additionally change pdf file name and legend titles. 
+
+df_graph$Sig<-df_graph$p_adjust<0.05
+df_graph$Up<-(df_graph$Logfold>0)*df_graph$Sig
+df_graph$Down<-(df_graph$Logfold<0)*df_graph$Sig
+
+df_graph$colour<-rep("#999999",nrow(df_graph))
+pathway1<-brain_intracellular
+pathway2<-brain_secreted 
+
+df_graph$colour[df_graph$gene_symbol %in% pathway1]<-"#355f8d"
+df_graph$colour[df_graph$gene_symbol %in% pathway2]<-"#22a884"
+df_graph$order<-rep(0.95,nrow(df_graph))
+df_graph$order[df_graph$gene_symbol %in% c(pathway1,pathway2)]<-1.4
+
+df_graph_ordered<-df_graph[order(df_graph$order,decreasing = F),]
+
+xmin<--4
+xmax<-4
+ymin<-0.001
+ymax<-5
+
+#pdf("volcanoplot_brain_proteins.pdf", height=7, width=5)
+
+plot( df_graph_ordered$Logfold, 
+      -log(df_graph_ordered$p_adjust, base=10), 
+      col=df_graph_ordered$colour,
+      pch=16, 
+      cex=df_graph_ordered$order, 
+      xlab="",
+      ylab="",
+      xlim=c(xmin,xmax),
+      ylim=c(ymin,ymax),
+      axes=F)
+
+axis(1)
+axis(2)
+
+title(xlab="Fold change (log2)", ylab="Adjusted p-value (log10)",mgp=c(2,2,0))
+
+legend(xmin,y=(1*ymax),  legend = c("Brain intracellular proteins", "Brain secreted proteins"), 
+       pch = 16, col = c("#355f8d","#22a884"), cex = 1, horiz=F,box.lwd = 0,box.col = "white",bg = "white")
+abline(h=1.36437635,lty=3)
+
+#dev.off()
+```
+
+## Figure 3b. 
+
+Volano plot of liver intracellular and secreted proteins
+```{r}  
+# Create a list for specific proteins of interest
+liver_secreted <- list("AGT", "ALB", "CFI", "F10", "F2", "F7", "GPLD1", "HABP2", "HGFAC", "IGFALS", "PROS1", "RBP4", "SELENOP", "SERPINC1", "SERPIND1", "SERPINF2")
+liver_intracellular <- list("ADH5", "ADK", "ALDH9A1", "ALDOB", "BHMT", "CMPK1", "GSTM1", "HMGB3", "MAN1A1", "MINPP1", "PAICS", "PEBP1", "PRDX6", "PSMA3", "SAR1B", "SOD1")
+
+# The following code is annotated in Chunk 19 for Figure 1b with changes to the pathways selected. Swap pathway1 and pathway2 to liver_secreted and liver_intracelluar as listed above. Additionally change pdf file name and legend titles. 
+
+df_graph$Sig<-df_graph$p_adjust<0.05
+df_graph$Up<-(df_graph$Logfold>0)*df_graph$Sig
+df_graph$Down<-(df_graph$Logfold<0)*df_graph$Sig
+
+df_graph$colour<-rep("#999999",nrow(df_graph))
+pathway1<-liver_intracellular
+pathway2<-liver_secreted 
+
+df_graph$colour[df_graph$gene_symbol %in% pathway1]<-"#355f8d"
+df_graph$colour[df_graph$gene_symbol %in% pathway2]<-"#22a884"
+df_graph$order<-rep(0.95,nrow(df_graph))
+df_graph$order[df_graph$gene_symbol %in% c(pathway1,pathway2)]<-1.4
+
+df_graph_ordered<-df_graph[order(df_graph$order,decreasing = F),]
+
+xmin<--4
+xmax<-4
+ymin<-0.001
+ymax<-5
+
+#pdf("volcanoplot_liver_proteins.pdf", height=7, width=5)
+
+plot( df_graph_ordered$Logfold, 
+      -log(df_graph_ordered$p_adjust, base=10), 
+      col=df_graph_ordered$colour,
+      pch=16, 
+      cex=df_graph_ordered$order, 
+      xlab="",
+      ylab="",
+      xlim=c(xmin,xmax),
+      ylim=c(ymin,ymax),
+      axes=F)
+
+axis(1)
+axis(2)
+
+title(xlab="Fold change (log2)", ylab="Adjusted p-value (log10)",mgp=c(2,2,0))
+
+legend(xmin,y=(1*ymax),  legend = c("Liver intracellular proteins", "Liver secreted proteins"), 
+       pch = 16, col = c("#355f8d","#22a884"), cex = 1, horiz=F,box.lwd = 0,box.col = "white",bg = "white")
+
+abline(h=1.36437635,lty=3)
+
+#dev.off()
+```
+
+## Figure 3c. 
+
+Volcano plot of stomach secreted and kidney secreted proteins 
+```{r}
+# Create a list for specific proteins of interest
+stomach_secreted <- list("GKN2", "PGA5")
+kidney_secreted <- list("GPX3")
+
+# The following code is annotated in Chunk 19 for Figure 1b with changes to the pathways selected. Swap pathway1 and pathway2 to stomach_secreted and kidney_secreted as listed above. Additionally change pdf file name and legend titles. 
+
+df_graph$Up<-(df_graph$Logfold>0)*df_graph$Sig
+df_graph$Down<-(df_graph$Logfold<0)*df_graph$Sig
+
+df_graph$colour<-rep("#999999",nrow(df_graph))
+pathway1<-stomach_secreted
+pathway2<-kidney_secreted
+
+df_graph$colour[df_graph$gene_symbol %in% pathway1]<-"#355f8d"
+df_graph$colour[df_graph$gene_symbol %in% pathway2]<-"#22a884"
+df_graph$order<-rep(0.95,nrow(df_graph))
+df_graph$order[df_graph$gene_symbol %in% c(pathway1,pathway2)]<-1.4
+
+df_graph_ordered<-df_graph[order(df_graph$order,decreasing = F),]
+
+xmin<--4
+xmax<-4
+ymin<-0.001
+ymax<-5
+
+#pdf("volcanoplot_stomach_kidney_proteins.pdf", height=7, width=5)
+
+plot( df_graph_ordered$Logfold, 
+      -log(df_graph_ordered$p_adjust, base=10), 
+      col=df_graph_ordered$colour,
+      pch=16, 
+      cex=df_graph_ordered$order, 
+      xlab="",
+      ylab="",
+      xlim=c(xmin,xmax),
+      ylim=c(ymin,ymax),
+      axes=F)
+
+axis(1)
+axis(2)
+
+title(xlab="Fold change (log2)", ylab="Adjusted p-value (log10)",mgp=c(2,2,0))
+
+legend(xmin,y=(1*ymax),  legend = c("Stomach secreted proteins", "Kidney secreted proteins"), 
+       pch = 16, col = c("#355f8d","#22a884"), cex = 1, horiz=F,box.lwd = 0,box.col = "white",bg = "white")
+
+abline(h=1.36437635,lty=3)
+
+#dev.off()
+```
+
+## Figure 3d. 
+
+Heatmap of brain intracellular and secreted proteins 
+```{r, fig.height=15, fig.width=22}
+
+# Combine the proteins from brain_secreted and brain_intracellular into one list
+genes_for_pathway <- list("APOD", "BDNF", "CNMD", "ENPP2", "OLFM1", "PROS1", "SERPIND1", "SERPINF1", "SOD3","ACTR3B", "AGA", "FKBP4", "GPX1", "GSTM3", "OPCML", "OPCML", "PCBP3", "TAGLN3", "YWHAG")
+
+# Creating the dataframe of the genes from df_graph
+pre_heatmap_df<-df_graph[df_graph$gene_symbol %in%   genes_for_pathway  ,c(5:35,37)]
+
+# Ordering proteins to be in alphabetical order displayed as secreted then intracellar
+custom_order <- c("APOD", "BDNF", "CNMD", "ENPP2", "OLFM1", "PROS1", "SERPIND1", "SERPINF1", "SOD3","ACTR3B", "AGA", "FKBP4", "GPX1", "GSTM3", "OPCML", "OPCML", "PCBP3", "TAGLN3", "YWHAG")
+
+# Reduce the pre_heatmap_df to only contain genes_for_pathway
+pre_heatmap_df <- pre_heatmap_df[order(match(pre_heatmap_df$gene_symbol, custom_order)),]
+
+# Z scoring
+pre_heatmap_df[,1:length(group_trimmed)]<-sqrt(pre_heatmap_df[,1:length(group_trimmed)])
+pre_heatmap_df$rowmean<-rowMeans(pre_heatmap_df[1:length(group_trimmed)], na.rm=T)
+pre_heatmap_df$rowSD<-apply(pre_heatmap_df[1:length(group_trimmed)],1, sd, na.rm=T)
+
+# Z scores into a new dataframe to replace raw protein counts
+heatmap_df<-pre_heatmap_df[,1:length(group_trimmed)]
+
+# Standardised scores
+for(i in 1:nrow(pre_heatmap_df)){
+    heatmap_df[i,]<-(pre_heatmap_df[i,1:length(group_trimmed)]-pre_heatmap_df$rowmean[i])/pre_heatmap_df$rowSD[i]
+
+}
+
+# Reordering the dataframe in order of quantity of plastic exposure from low plastic to high plastic 
+heatmap_df<-heatmap_df[, c("91084", "91058", "91074", "91055", "91085", "91053", "91081", "91082", "91064", "91051", "89704", "91057", "91073", "91091", "91094", "91076", "91089", "91087", "91062", "91095", "91099", "89701", "91097", "91059", "91054", "91098", "89703", "89702", "91075", "91096", "91093")]
+
+pheatmap(heatmap_df,# Data frame containing the values above to create a heatmap using pheatmap
+         labels_row=pre_heatmap_df$gene_symbol, # Label the rows of the heatmap with the gene symbol 
+         scale = "row", 
+         labels_col=group_trimmed[c(which(group_trimmed=="Low Plastic"), which(group_trimmed=="High Plastic"))], # Label the columns as Low or High plastic exposure
+         fontsize_row=12, # Font size for row labels 
+         cluster_cols = F, cluster_rows = F, # Disables clustering of columns and rows
+         legend=T, # Displays the legend for the colour spectrum
+         cellwidth = 30, cellheight = 20,# Sets the dimensions of each cell within the heatmap
+         breaks=seq(-2,2, length.out =11), # Defines the colour spectrum, how many colours out of 11 colours 
+         color = rev(brewer.pal(11, "RdBu"))) # Using the RdBu palette from the RColorBrewer package reversed so blue is negative and red is positive
+
+```
+
+## Figure 3e. 
+
+Heatmap of liver intracellular and secreted proteins
+```{r, fig.height=15, fig.width=22}
+# The following code is annotated in Chunk 24 for Figure 3d with changes to the genes for pathways. 
+
+# Combine the proteins from liver_secreted and liver_intracellular into one list
+genes_for_pathway<- list("AGT", "ALB", "CFI", "F10", "F2", "F7", "GPLD1", "HABP2", "HGFAC", "IGFALS", "PROS1", "RBP4", "SELENOP", "SERPINC1", "SERPIND1", "SERPINF2", "ADH5", "ADK", "ALDH9A1", "ALDOB", "BHMT", "CMPK1", "GSTM1", "HMGB3", "MAN1A1", "MINPP1", "PAICS", "PEBP1", "PRDX6", "PSMA3", "SAR1B", "SOD1")
+
+pre_heatmap_df<-df_graph[df_graph$gene_symbol%in%   genes_for_pathway  ,c(5:35,37)]
+
+custom_order <- c("AGT", "ALB", "CFI", "F10", "F2", "F7", "GPLD1", "HABP2", "HGFAC", "IGFALS", "PROS1", "RBP4", "SELENOP", "SERPINC1", "SERPIND1", "SERPINF2", "ADH5", "ADK", "ALDH9A1", "ALDOB", "BHMT", "CMPK1", "GSTM1", "HMGB3", "MAN1A1", "MINPP1", "PAICS", "PEBP1", "PRDX6", "PSMA3", "SAR1B", "SOD1")
+
+pre_heatmap_df <- pre_heatmap_df[order(match(pre_heatmap_df$gene_symbol, custom_order)),]
+
+pre_heatmap_df[,1:length(group_trimmed)]<-sqrt(pre_heatmap_df[,1:length(group_trimmed)])
+pre_heatmap_df$rowmean<-rowMeans(pre_heatmap_df[1:length(group_trimmed)], na.rm=T)
+pre_heatmap_df$rowSD<-apply(pre_heatmap_df[1:length(group_trimmed)],1, sd, na.rm=T)
+
+heatmap_df<-pre_heatmap_df[,1:length(group_trimmed)]
+
+for(i in 1:nrow(pre_heatmap_df)){
+    heatmap_df[i,]<-(pre_heatmap_df[i,1:length(group_trimmed)]-pre_heatmap_df$rowmean[i])/pre_heatmap_df$rowSD[i]
+
+}
+
+heatmap_df<-heatmap_df[, c("91084", "91058", "91074", "91055", "91085", "91053", "91081", "91082", "91064", "91051", "89704", "91057", "91073", "91091", "91094", "91076", "91089", "91087", "91062", "91095", "91099", "89701", "91097", "91059", "91054", "91098", "89703", "89702", "91075", "91096", "91093")]
+
+pheatmap(heatmap_df, 
+         labels_row=pre_heatmap_df$gene_symbol, 
+         scale = "row",
+         labels_col=group_trimmed[c(which(group_trimmed=="Low Plastic"), which(group_trimmed=="High Plastic"))], 
+         fontsize_row=12, 
+         cluster_cols = F, cluster_rows = F, 
+         legend=T, 
+         cellwidth = 30, cellheight = 20, 
+         breaks=seq(-2,2, length.out =11), 
+         color = rev(brewer.pal(11, "RdBu")))
+
+```
